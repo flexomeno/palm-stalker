@@ -44,7 +44,8 @@ docker run --rm \
   --output-csv "/data/reporte.csv" \
   --patch-size 800 \
   --patch-overlap 0.15 \
-  --score-threshold 0.30
+  --score-threshold 0.30 \
+  --dedup-radius-m 2.0
 ```
 
 ## Parametros del script (`main.py`)
@@ -55,6 +56,7 @@ docker run --rm \
 - `--patch-size` (opcional): tamano de tile para inferencia. Default: `800`.
 - `--patch-overlap` (opcional): traslape de tiles en `[0,1)`. Default: `0.15`.
 - `--score-threshold` (opcional): confianza minima de deteccion en `[0,1]`. Default: `0.30`.
+- `--dedup-radius-m` (opcional): radio en metros para deduplicar detecciones cercanas. Default: `2.0`.
 
 ## Salidas generadas
 
@@ -62,15 +64,17 @@ docker run --rm \
    - Geometria puntual por palma detectada.
    - Incluye campos de identificador, score, etiqueta y distancia al vecino.
 2. `reporte.csv`
-   - Columnas: `id`, `lat`, `lon`, `distancia_al_vecino`.
+   - Columnas: `id`, `lat`, `lon`, `distancia_al_vecino_m`.
 
 ## Flujo de procesamiento
 
 1. Carga del modelo DeepForest preentrenado.
 2. Inferencia por tiles (`predict_tile`) para evitar cargar todo el raster en memoria.
 3. Conversion de centroides de pixeles a coordenadas reales usando CRS y transform del raster.
-4. Calculo de distancia al vecino mas cercano con `cKDTree`.
-5. Exportacion de resultados a GeoJSON y CSV.
+4. Reproyeccion automatica a CRS metrico (UTM estimado) para distancias en metros.
+5. Deduplicacion espacial por radio para reducir cajas repetidas en bordes de tile.
+6. Calculo de distancia al vecino mas cercano con `cKDTree`.
+7. Exportacion de resultados a GeoJSON y CSV.
 
 ## Monitoreo y rendimiento
 

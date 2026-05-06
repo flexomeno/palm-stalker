@@ -70,6 +70,12 @@ def parse_args() -> argparse.Namespace:
         default=0.3,
         help="Umbral de confianza para conservar detecciones.",
     )
+    parser.add_argument(
+        "--dedup-radius-m",
+        type=float,
+        default=2.0,
+        help="Radio en metros para deduplicar detecciones cercanas.",
+    )
     return parser.parse_args()
 
 
@@ -86,6 +92,24 @@ def validate_inputs(args: argparse.Namespace, logger: logging.Logger) -> None:
         raise ValueError("--score-threshold debe estar en [0, 1].")
     if args.patch_size < 200:
         logger.warning("patch-size muy pequeno puede degradar precision y rendimiento.")
+    if args.dedup_radius_m < 0:
+        raise ValueError("--dedup-radius-m debe ser >= 0.")
+
+    with rasterio.open(tif_path) as src:
+        if src.crs is None:
+            raise ValueError("El TIFF no tiene CRS definido. No se pueden generar coordenadas geograficas.")
+        if src.count < 3:
+            logger.warning(
+                "El raster tiene %s banda(s). DeepForest suele funcionar mejor con RGB (3 bandas).",
+                src.count,
+            )
+        logger.info(
+            "Validacion raster OK: size=%sx%s, bands=%s, CRS=%s",
+            src.width,
+            src.height,
+            src.count,
+            src.crs,
+        )
 
 
 def initialize_model(logger: logging.Logger):
@@ -176,7 +200,7 @@ def pixel_to_map_coordinates(
     gdf = gpd.GeoDataFrame(
         {
             "id": np.arange(1, len(predictions) + 1, dtype=int),
-            "score": predictions.get("score", pd.Series([None] * len(predictions))).values,
+            "score": predictions.get("score", pd.Series([np.nan] * len(predictions))).values,
             "label": predictions.get("label", pd.Series(["palma"] * len(predictions))).values,
             "x_map": np.array(x_map, dtype=float),
             "y_map": np.array(y_map, dtype=float),
@@ -188,26 +212,95 @@ def pixel_to_map_coordinates(
     return gdf
 
 
+def project_to_metric_crs(gdf: gpd.GeoDataFrame, logger: logging.Logger) -> gpd.GeoDataFrame:
+    if gdf.empty:
+        return gdf.copy()
+
+    if gdf.crs is None:
+        raise ValueError("El GeoDataFrame no tiene CRS; no es posible proyectar a metros.")
+
+    if gdf.crs.is_projected:
+        logger.info("CRS ya proyectado (%s). Se asume unidad metrica.", gdf.crs)
+        return gdf.copy()
+
+    estimated_utm = gdf.estimate_utm_crs()
+    if estimated_utm is None:
+        raise ValueError("No se pudo estimar CRS UTM para calculo de distancias en metros.")
+
+    logger.info("Reproyectando a CRS metrico para analisis de distancia: %s", estimated_utm)
+    return gdf.to_crs(estimated_utm)
+
+
+def deduplicate_by_radius(
+    gdf_metric: gpd.GeoDataFrame,
+    dedup_radius_m: float,
+    logger: logging.Logger,
+) -> gpd.GeoDataFrame:
+    if gdf_metric.empty or dedup_radius_m <= 0:
+        if dedup_radius_m <= 0:
+            logger.info("Deduplicacion desactivada (radio <= 0).")
+        return gdf_metric
+
+    coords = np.column_stack((gdf_metric.geometry.x.to_numpy(), gdf_metric.geometry.y.to_numpy()))
+    tree = cKDTree(coords)
+    n = len(coords)
+    visited = np.zeros(n, dtype=bool)
+    keep_indices = []
+    scores = gdf_metric["score"].fillna(0.0).to_numpy(dtype=float)
+
+    for idx in range(n):
+        if visited[idx]:
+            continue
+
+        neighbor_ids = tree.query_ball_point(coords[idx], r=dedup_radius_m)
+        component = []
+        stack = list(neighbor_ids)
+        while stack:
+            current = stack.pop()
+            if visited[current]:
+                continue
+            visited[current] = True
+            component.append(current)
+            stack.extend(tree.query_ball_point(coords[current], r=dedup_radius_m))
+
+        # Mantiene la deteccion de mayor score por cluster espacial.
+        best_idx = max(component, key=lambda i: scores[i])
+        keep_indices.append(best_idx)
+
+    dedup_gdf = gdf_metric.iloc[sorted(keep_indices)].copy().reset_index(drop=True)
+    dedup_gdf["id"] = np.arange(1, len(dedup_gdf) + 1, dtype=int)
+    logger.info(
+        "Deduplicacion aplicada con radio %.2fm: %s -> %s detecciones.",
+        dedup_radius_m,
+        len(gdf_metric),
+        len(dedup_gdf),
+    )
+    return dedup_gdf
+
+
 def compute_nearest_neighbor_distance(gdf: gpd.GeoDataFrame, logger: logging.Logger) -> gpd.GeoDataFrame:
     if gdf.empty:
-        gdf["distancia_al_vecino"] = []
+        gdf["distancia_al_vecino_m"] = []
         return gdf
 
-    coords = np.column_stack((gdf["x_map"].to_numpy(), gdf["y_map"].to_numpy()))
+    coords = np.column_stack((gdf.geometry.x.to_numpy(), gdf.geometry.y.to_numpy()))
 
     if len(coords) == 1:
-        gdf["distancia_al_vecino"] = np.nan
+        gdf["distancia_al_vecino_m"] = np.nan
         return gdf
 
     tree = cKDTree(coords)
     distances, _ = tree.query(coords, k=2)
-    gdf["distancia_al_vecino"] = distances[:, 1]
-    logger.info("Distancias a vecino mas cercano calculadas para %s palmas.", len(gdf))
+    gdf["distancia_al_vecino_m"] = distances[:, 1]
+    logger.info("Distancias al vecino mas cercano calculadas para %s palmas.", len(gdf))
     return gdf
 
 
 def export_results(
-    gdf: gpd.GeoDataFrame, output_geojson: str, output_csv: str, logger: logging.Logger
+    gdf_original_crs: gpd.GeoDataFrame,
+    output_geojson: str,
+    output_csv: str,
+    logger: logging.Logger,
 ) -> None:
     output_geojson_path = Path(output_geojson)
     output_csv_path = Path(output_csv)
@@ -215,22 +308,22 @@ def export_results(
     output_geojson_path.parent.mkdir(parents=True, exist_ok=True)
     output_csv_path.parent.mkdir(parents=True, exist_ok=True)
 
-    gdf.to_file(output_geojson_path, driver="GeoJSON")
+    gdf_original_crs.to_file(output_geojson_path, driver="GeoJSON")
     logger.info("GeoJSON guardado en: %s", output_geojson_path)
 
-    if gdf.empty:
-        csv_df = pd.DataFrame(columns=["id", "lat", "lon", "distancia_al_vecino"])
+    if gdf_original_crs.empty:
+        csv_df = pd.DataFrame(columns=["id", "lat", "lon", "distancia_al_vecino_m"])
         csv_df.to_csv(output_csv_path, index=False)
         logger.info("CSV vacio guardado en: %s", output_csv_path)
         return
 
-    gdf_ll = gdf.to_crs(epsg=4326)
+    gdf_ll = gdf_original_crs.to_crs(epsg=4326)
     csv_df = pd.DataFrame(
         {
             "id": gdf_ll["id"].astype(int),
             "lat": gdf_ll.geometry.y.astype(float),
             "lon": gdf_ll.geometry.x.astype(float),
-            "distancia_al_vecino": gdf["distancia_al_vecino"].astype(float),
+            "distancia_al_vecino_m": gdf_original_crs["distancia_al_vecino_m"].astype(float),
         }
     )
     csv_df.to_csv(output_csv_path, index=False)
@@ -257,10 +350,24 @@ def main():
     logger.info("Total detecciones finales: %s", len(predictions))
 
     gdf = pixel_to_map_coordinates(predictions=predictions, tif_path=tif_path, logger=logger)
-    gdf = compute_nearest_neighbor_distance(gdf=gdf, logger=logger)
+    gdf_metric = project_to_metric_crs(gdf=gdf, logger=logger)
+    gdf_metric = deduplicate_by_radius(
+        gdf_metric=gdf_metric,
+        dedup_radius_m=args.dedup_radius_m,
+        logger=logger,
+    )
+    gdf_metric = compute_nearest_neighbor_distance(gdf=gdf_metric, logger=logger)
+
+    if gdf_metric.empty:
+        gdf_output = gdf_metric
+    else:
+        gdf_output = gdf_metric.to_crs(gdf.crs)
+        gdf_output["distancia_al_vecino_m"] = gdf_metric["distancia_al_vecino_m"].to_numpy()
+        gdf_output["x_map"] = gdf_output.geometry.x.to_numpy()
+        gdf_output["y_map"] = gdf_output.geometry.y.to_numpy()
 
     export_results(
-        gdf=gdf,
+        gdf_original_crs=gdf_output,
         output_geojson=args.output_geojson,
         output_csv=args.output_csv,
         logger=logger,
