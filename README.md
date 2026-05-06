@@ -57,6 +57,8 @@ docker run --rm \
 - `--patch-overlap` (opcional): traslape de tiles en `[0,1)`. Default: `0.15`.
 - `--score-threshold` (opcional): confianza minima de deteccion en `[0,1]`. Default: `0.30`.
 - `--dedup-radius-m` (opcional): radio en metros para deduplicar detecciones cercanas. Default: `2.0`.
+- `--count-only` (opcional): mantiene todo el pipeline y adicionalmente exporta conteo total.
+- `--output-count` (opcional): ruta del archivo de conteo total. Default: `conteo_total.txt`.
 
 ## Salidas generadas
 
@@ -65,6 +67,8 @@ docker run --rm \
    - Incluye campos de identificador, score, etiqueta y distancia al vecino.
 2. `reporte.csv`
    - Columnas: `id`, `lat`, `lon`, `distancia_al_vecino_m`.
+3. `conteo_total.txt` (si activas `--count-only`)
+   - Formato: `conteo_total,<numero>`
 
 ## Flujo de procesamiento
 

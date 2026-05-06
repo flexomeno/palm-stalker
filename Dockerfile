@@ -11,6 +11,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgdal-dev \
     proj-bin \
     libproj-dev \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    libx11-6 \
+    libxcb1 \
+    libgl1 \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 

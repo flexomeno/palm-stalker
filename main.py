@@ -76,6 +76,17 @@ def parse_args() -> argparse.Namespace:
         default=2.0,
         help="Radio en metros para deduplicar detecciones cercanas.",
     )
+    parser.add_argument(
+        "--count-only",
+        action="store_true",
+        help="Mantiene todo el pipeline y ademas exporta un archivo de conteo total.",
+    )
+    parser.add_argument(
+        "--output-count",
+        type=str,
+        default="conteo_total.txt",
+        help="Ruta del archivo de salida para el conteo total.",
+    )
     return parser.parse_args()
 
 
@@ -330,6 +341,13 @@ def export_results(
     logger.info("CSV guardado en: %s", output_csv_path)
 
 
+def export_count(total_count: int, output_count: str, logger: logging.Logger) -> None:
+    output_count_path = Path(output_count)
+    output_count_path.parent.mkdir(parents=True, exist_ok=True)
+    output_count_path.write_text(f"conteo_total,{int(total_count)}\n", encoding="utf-8")
+    logger.info("Conteo total guardado en: %s", output_count_path)
+
+
 def main():
     logger = configure_logger()
     args = parse_args()
@@ -372,6 +390,10 @@ def main():
         output_csv=args.output_csv,
         logger=logger,
     )
+
+    if args.count_only:
+        export_count(total_count=len(gdf_output), output_count=args.output_count, logger=logger)
+        logger.info("Modo count-only activo. Conteo total de palmas: %s", len(gdf_output))
 
     logger.info("Procesamiento finalizado correctamente.")
 
